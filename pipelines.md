@@ -1,6 +1,6 @@
 # System.IO.Pipelines: High performance IO in .NET
 
-[System.IO.Pipelines](https://www.nuget.org/packages/System.IO.Pipelines/) is a new library that is designed to make it easier to do high performance IO in .NET. It's a library targeting .NET Standard that works on all .NET implementations. 
+[System.IO.Pipelines](https://www.nuget.org/packages/System.IO.Pipelines/) is a new, high performance IO library for .NET. It targets .NET Standard and works on all .NET implementations. 
 
 Pipelines was born from the work the .NET Core team did to make Kestrel one of the [fastest web servers in the industry](https://www.techempower.com/benchmarks/#section=data-r16&hw=ph&test=plaintext). What started as an implementation detail inside of Kestrel progressed into a re-usable API that shipped in 2.1 as a first class BCL API (System.IO.Pipelines) available for all .NET developers. 
 
@@ -30,14 +30,9 @@ async Task AcceptAsync(Socket socket)
 }
 ```
 
-This code might work when testing locally but it's has several errors:
-- The entire message (end of line) may not have been received in a single call to `ReadAsync`. 
-- It's ignoring the result of `stream.ReadAsync()` which returns how much data was actually filled into the buffer.
-- It doesn't handle the case where multiple lines come back in a single `ReadAsync` call.
+This code might work when testing locally but it's broken because the entire message (end of line) may not have been received in a single call to `ReadAsync`. Even worse, we're failing to look at the result of `stream.ReadAsync()` which returns how much data was actually filled into the buffer. 
 
-These are some of the common pitfalls when reading streaming data. To account for this we need to make a few changes:
-- We need to buffer the incoming data until we have found a new line.
-- We need to parse *all* of the lines returned in the buffer.
+This is a common mistake when using `Stream` today. To account for this, we need to buffer the incoming data until we have found a new line:
 
 ```C#
 async Task AcceptAsync(Socket socket)
@@ -55,7 +50,7 @@ async Task AcceptAsync(Socket socket)
         read += current;
         var lineLength = Array.IndexOf(buffer, (byte)'\n', 0, read);
 
-        if (lineLength >= 0) 
+        if (lineLength >= 0)
         {
             ProcessLine(buffer, 0, lineLength);
             read = 0;
@@ -153,7 +148,7 @@ async Task AcceptAsync(Socket socket)
 }
 ```
 
-This code just got much more complicated. We're keeping track of the filled up buffers as we're looking for the delimeter. To do this, we're using a `List<ArraySegment<byte>>` here to represent the buffered data while looking for the new line delimeter. As a result, `ProcessLine` now accepts a `List<ArraySegment<byte>>` instead of a `byte[]`, `offset` and `count`. Our parsing logic needs to now handle one or more buffer segments.
+This code just got much more complicated. We're keeping track the filled up buffers as we're looking for the delimeter. To do this, we're using a `List<ArraySegment<byte>>` here to represent the buffered data while looking for the new line delimeter. As a result, `ProcessLine` now accepts a `List<ArraySegment<byte>>` instead of a `byte[]`, `offset` and `count`. Our parsing logic needs to now handle one or more buffer segments.
 
 There's another optimization that we need to make before we call this server complete. Right now we have a bunch of heap allocated buffers in a list. 
 
@@ -210,15 +205,15 @@ async Task AcceptAsync(Socket socket)
 }
 ```
 
-Our server now handles partial messages, and it uses pooled memory to reduce overall memory consumption but there are still a couple more changes we need to make: 
+Our server now handles partial messages, and it uses pooled memory to reduce overall memory consumption but there are still a couple more changes we want to make: 
 
-1. The `byte[]` we're using from the `ArrayPool<byte>` are just regular managed arrays. This means whenever we do a `ReadAsync` or `WriteAsync`, those buffers get pinned for the lifetime of the asynchronous operation (in order to interop with the native IO APIs on the operating system). This has performance implications on the garbage collector since pinned memory cannot be moved which can lead to heap fragmentation. Depending on how long the async operations are pending, the pool implementation may need to change. 
+1. The `byte[]` we're using from the `ArrayPool<byte>` are just regular managed arrays. This means whenever we do a `ReadAsync` or `WriteAsync`, those buffers get pinned for the lifetime of the asynchornous operation (in order to interop with the native IO APIs on the operating system). This has performance implications on the garbage collector since pinned memory cannot be moved which can lead to heap fragmentation. Depending on how long the async operations are pending, the pool implementation may need to change. 
 2. The throughput can be optimized by decoupling the reading and processing logic. This creates a batching effect that lets the parsing logic consume larger chunks of buffers, instead of reading more data only after parsing a single line. This introduces some additional complexity:
-    - We need two loops that run independently of each other. One that reads from the `Socket` and one that parses the buffers.
+    - We need 2 loops that run independently of each other. One that reads from the `Socket` and one that parses the buffers.
     - We need a way to signal the parsing logic when data becomes available.
     - We need to decide what happens if the loop reading from the `Socket` is "too fast". We need a way to throttle the reading loop if the parsing logic can't keep up. This is commonly referred to as "flow control" or "back pressure".
     - We need to make sure things are thread safe. We're now sharing a set of buffers between the reading loop and the parsing loop and those run independently on different threads.
-    - The memory management logic is now spread across two different pieces of code, the code that rents from the buffer pool is reading from the socket and the code that returns from the buffer pool is the parsing logic.
+    - The memory management logic is now spread across 2 different pieces of code, the code that rents from the buffer pool is reading from the socket and the code that returns from the buffer pool is the parsing logic.
     - We need to be extremely careful with how we return buffers after the parsing logic is done with them. If we're not careful, it's possible that we return a buffer that's still being written to by the `Socket` reading logic.
 
 The complexity has gone through the roof (and we haven't even covered all of the cases). High performance networking usually means writing very complex code in order to eke out more performance from the system. 
@@ -279,20 +274,13 @@ async Task ReadPipeAsync(PipeReader reader)
         ReadResult result = await reader.ReadAsync();
 
         ReadOnlySequence<byte> buffer = result.Buffer;
-        SequencePosition? position = null;
-        
-        
-        do 
-        {
-            position = buffer.PositionOf((byte)'\n');
+        SequencePosition? position = buffer.PositionOf((byte)'\n');
 
-            if (position != null)
-            {
-                ProcessLine(buffer.Slice(0, position.Value));
-                buffer = buffer.Slice(buffer.GetPosition(1, position.Value));
-            }
+        if (position != null)
+        {
+            ProcessLine(buffer.Slice(0, position.Value));
+            buffer = buffer.Slice(buffer.GetPosition(1, position.Value));
         }
-        while (position != null);
 
         reader.AdvanceTo(buffer.Start);
 
@@ -316,7 +304,7 @@ Unlike the original examples, there are no explicit buffers allocated anywhere. 
 
 In the first loop, we first call `PipeWriter.GetMemory(int)` to get some memory from the underlying writer then we call `PipeWriter.Advance(int)` to tell the `PipeWriter` how much data we actually wrote to the buffer. We then call `PipeWriter.FlushAsync()` to make the data available to the `PipeReader`.
 
-In the second loop, we're consuming the buffers written by the `PipeWriter` which ultimately comes from the `Socket`. When the call to `PipeReader.ReadAsync()` returns, we get a `ReadResult` which contains 2 important pieces of information, the data that was read in the form of `ReadOnlySequence<byte>` and a bool `IsCompleted` that lets the reader know if the writer is done writing (EOF). After finding the end of line (EOL) delimiter and parsing the line, we slice the buffer to skip what we've already processed and then we call `PipeReader.AdvanceTo` to tell the `PipeReader` how much data we have both consumed and observed. 
+In the second loop, we're consuming the buffers written by the `PipeWriter` which ultimately comes from the `Socket`. When the call to `PipeReader.ReadAsync()` returns, we get a `ReadResult` which contains 2 important pieces of information, the data that was read in the form of `ReadOnlySequence<byte>` and a bool `IsCompleted` that lets the reader know if the writer is done writing (EOF). After finding the line end delimeter and parsing the line, we slice the buffer to skip what we've already processed and then we call `PipeReader.AdvanceTo` to tell the `PipeReader` how much data we have both consumed and observed. 
 
 At the end of each of the loops, we complete both the reader and the writer. This lets the underlying `Pipe` release all of the memory it allocated.
 
@@ -326,15 +314,13 @@ At the end of each of the loops, we complete both the reader and the writer. Thi
 
 Besides handling the memory management, the other core pipelines feature is the ability to peek at data in the `Pipe` without actually consuming it. 
 
-`PipeReader` has two core APIs `ReadAsync` and `AdvanceTo`. `ReadAsync` gets the data in the `Pipe`, `AdvanceTo` tells the `PipeReader` that these buffers are no longer required by the reader so they can be discarded (for example returned to the underlying buffer pool). 
+`PipeReader` has 2 core APIs `ReadAsync` and `AdvanceTo`. `ReadAsync` gets the data in the `Pipe`, `AdvanceTo` does a couple of things, it tells the `PipeReader` that these buffers are no longer required by the reader so they can be discarded (for example returned to the underlying buffer pool). 
 
-Here's an example of an http parser that reads partial data buffers data in the `Pipe` until a valid start line is received.
-
-![image](https://user-images.githubusercontent.com/95136/42349904-1a6e3484-8063-11e8-8ac2-7f8e636b4a23.png)
+It also allows the reader to tell the `PipeReader` "don't wake me up again until there's more data available". This is important for the performance of the reader as it means the reader won't be signalled until there's more data than was previously marked "observed".
 
 ### ReadOnlySequence\<T\>
 
-The `Pipe` implementation stores a linked list of buffers that get passed between the `PipeWriter` and `PipeReader`. `PipeReader.ReadAsync` exposes a `ReadOnlySequence<T>` which is a new BCL type that represents a view over one or more  segments of `ReadOnlyMemory<T>`, similar to `Span<T>` and `Memory<T>` which provide a view over arrays and strings.
+The `Pipe` implementation stores a linked list of buffers that get passed between the `PipeWriter` and `PipeReader`. `PipeReader.ReadAsync` exposes a `ReadOnlySequence<T>` which is a new BCL type that represents a view over one or more segments of `ReadOnlyMemory<T>`, similar to `Span<T>` and `Memory<T>` which provide a view over arrays and strings.
 
 ![image](https://user-images.githubusercontent.com/95136/42292592-74a4028e-7f88-11e8-85f7-a6b2f925769d.png)
 
@@ -368,7 +354,7 @@ string GetAsciiString(ReadOnlySequence<byte> buffer)
 
 In a perfect world, reading & parsing are working as a team: the reading thread consumes the data from the network and puts it in buffers while the parsing thread is responsible for constructing the appropriate data structures. Normally, parsing will take more time than just copying blocks of data from the network. As a result, the reading thread can easily overwhelm the parsing thread. The result is that the parsing thread will either have to either slow down or allocate more memory to store the data for the parsing thread. For optimal performance, there is a balance between frequent pauses and allocating more memory.
 
-To solve this problem, the pipe has two settings to control the flow of data, the `PauseWriterThreshold` and the `ResumeWriterThreshold`. The `PauseWriterThreshold` determines how much data should be buffered before calls to `PipeWriter.FlushAsync` pauses. The `ResumeWriterThreshold` controls how much the reader has to consume before writing can resume.
+To solve this problem, the pipe has 2 settings to control the flow of data, the `PauseWriterThreshold` and the `ResumeWriterThreshold`. The `PauseWriterThreshold` determines how much data should be buffered before calls to `PipeWriter.FlushAsync` pauses. The `ResumeWriterThreshold` controls how much the reader has to consume before writing can resume.
 
 ![image](https://user-images.githubusercontent.com/95136/42291183-0114a0f2-7f7f-11e8-983f-5332b7585a09.png)
 
@@ -378,21 +364,21 @@ To solve this problem, the pipe has two settings to control the flow of data, th
 
 Usually when using async/await, continuations are called on either on thread pool threads or on the current `SynchronizationContext`. 
 
-When doing IO it's very important to have fine grained control over where that IO is performed so that one can take advantage of CPU caches more effectively, which is critical for high-performance oriented application, such as web servers. Pipelines exposes a `PipeScheduler` that determines where asynchronous callbacks run. This gives the caller fine grained control over exactly what threads are used for IO. 
+When doing IO it's very important to have fine-grained control over where that IO is performed so that one can take advantage of CPU caches more effectively, which is critical for high-performance oriented application, such as web servers. Pipelines exposes a `PipeScheduler` that determines where asynchronous callbacks run. This gives the caller fine-grained control over exactly what threads are used for IO. 
 
 An example of this in practice is in the Kestrel Libuv transport where IO callbacks run on dedicated event loop threads.
 
 ### Other benefits of the `PipeReader` pattern:
-- Some underlying systems support a "bufferless wait", that is, a buffer never needs to be allocated until there's actually data available in the underlying system. For example on linux with epoll, it's possible to wait until data is ready before actually supplying a buffer to do the read. This avoids the problem where having a large number of threads waiting for data doesn't immediately require reserving a huge amount of memory.
+- Some underlying systems support a "bufferless wait", that is, a buffer never needs to be allocated until there's actually data available in the underlying system. For example on Linux with epoll, it's possible to wait until data is ready before actually supplying a buffer to do the read. This avoids the problem where having a large number of threads waiting for data doesn't immediately require reserving a huge amount of memory.
 - The default `Pipe` makes it easy to write unit tests against networking code because the parsing logic is separated from the networking code so unit tests only run the parsing logic against in-memory buffers rather than consuming directly from the network. It also makes it easy to test those hard to test patterns where partial data is sent. ASP.NET Core uses this to test various aspects of the Kestrel's http parser.
 - Systems that allow exposing the underlying OS buffers (like the Registered IO APIs on Windows) to user code are a natural fit for pipelines since buffers are always provided by the `PipeReader` implementation. 
 
 ### Other Related types
 
 As part of making System.IO.Pipelines, we also added a number of new primitive BCL types:
-- [MemoryPool\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.memorypool-1?view=netcore-2.1), [IMemoryOwner\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.imemoryowner-1?view=netcore-2.1), [MemoryManager\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.memorymanager-1?view=netcore-2.1) - .NET Core 1.0 added [ArrayPool\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1?view=netcore-2.1) and in .NET Core 2.1 we now have a more general abstration for a pool that works for more than just `T[]`.
-- [IBufferWriter\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.buffers.ibufferwriter-1?view=netcore-2.1) - Represents a sink for writing synchronous buffered data. (`PipeWriter` implements this)
-- [IValueTaskSource<T>](https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.sources.ivaluetasksource-1?view=netcore-2.1) - [ValueTask\<T\>](https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.valuetask-1?view=netcore-2.1) has existed since .NET Core 1.1 but has gained some super powers in .NET Core 2.1 to allow allocation-free awaitable async operations. See https://github.com/dotnet/corefx/issues/27445 for more details.
+- `MemoryPool<T>`, `IMemoryOwner<T>`, `MemoryManager<T>` - .NET Core 1.0 added `ArrayPool<T>` and in .NET Core 2.1 we now have a more general abstration for a pool that works for more than just `T[]`.
+- `IBufferWriter<T>` - Represents a sink for writing synchronous buffered data. (`PipeWriter` implements this)
+- `IValueTaskSource<T>`, `ValueTask` (non-generic) - `ValueTask<T>` has existed since .NET Core 1.1 but has gained some super powers in .NET Core 2.1 to allow allocation-free awaitable async operations. See https://github.com/dotnet/corefx/issues/27445 for more details.
 
 ## How do I use Pipelines?
 
